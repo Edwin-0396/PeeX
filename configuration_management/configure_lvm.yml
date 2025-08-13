@@ -1,0 +1,78 @@
+---
+- name: Configure LVM for /var and migrate data
+  hosts: your_target_server
+  become: yes
+  vars:
+    new_disk: /dev/sdb
+    vg_name: var_vg
+    lv_name: var_lv
+    mount_point: /var
+
+  tasks:
+    - name: Create a new GPT partition on the new disk
+      community.general.parted:
+        device: "{{ new_disk }}"
+        number: 1
+        state: present
+        flags: [ lvm ]
+        label: gpt
+
+    - name: Create a Physical Volume (PV)
+      community.general.pv:
+        pvs: "{{ new_disk }}1"
+        state: present
+
+    - name: Create a Volume Group (VG)
+      community.general.lvg:
+        vg: "{{ vg_name }}"
+        pvs: "{{ new_disk }}1"
+        state: present
+
+    - name: Create a Logical Volume (LV)
+      community.general.lvol:
+        vg: "{{ vg_name }}"
+        lv: "{{ lv_name }}"
+        size: "100%FREE"
+        state: present
+
+    - name: Create an ext4 filesystem on the Logical Volume
+      community.general.filesystem:
+        fstype: ext4
+        dev: "/dev/{{ vg_name }}/{{ lv_name }}"
+    - name: Mount the new volume temporarily
+      ansible.posix.mount:
+        path: /mnt/new_var
+        src: "/dev/{{ vg_name }}/{{ lv_name }}"
+        fstype: ext4
+        state: mounted
+
+    - name: Copy data from old /var to new /var
+      ansible.posix.synchronize:
+        src: /var/
+        dest: /mnt/new_var/
+        archive: yes
+        delete: yes
+
+    - name: Unmount the temporary volume
+      ansible.posix.mount:
+        path: /mnt/new_var
+        state: unmounted
+
+    - name: Rename old /var directory
+      ansible.builtin.command: mv /var /var_old
+      args:
+        creates: /var_old
+
+    - name: Create a new /var mount point
+      ansible.builtin.file:
+        path: /var
+        state: directory
+        mode: '0755'
+
+    - name: Mount the new /var and add it to fstab
+      ansible.posix.mount:
+        path: "{{ mount_point }}"
+        src: "/dev/{{ vg_name }}/{{ lv_name }}"
+        fstype: ext4
+        opts: "defaults,nofail"
+        state: mounted
