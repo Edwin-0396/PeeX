@@ -1,0 +1,116 @@
+---
+- name: Configure LVM for /var in Ubuntu EC2
+  hosts: ec2
+  become: yes
+  vars:
+    disk_device: "/dev/xvdf"
+    vg_name: "vg_var"
+    lv_name: "lv_var"
+    mount_point: "/var"
+    temp_mount: "/mnt/var_new"
+    lv_size: "100%FREE"
+  tasks:
+    - name: Ensure lvm2 and rsync are installed
+      apt:
+        name: ['lvm2', 'rsync']
+        state: present
+        update_cache: true
+
+    - name: Create physical volume
+      community.general.lvm_pv:
+        pvs: "{{ disk_device }}"
+      register: pv_result
+
+    - name: Create volume group
+      community.general.lvg:
+        vg: "{{ vg_name }}"
+        pvs: "{{ disk_device }}"
+      register: vg_result
+
+    - name: Create logical volume
+      community.general.lvol:
+        vg: "{{ vg_name }}"
+        lv: "{{ lv_name }}"
+        size: "{{ lv_size }}"
+        state: present
+      register: lv_result
+
+    - name: Format logical volume as ext4
+      filesystem:
+        fstype: ext4
+        dev: "/dev/{{ vg_name }}/{{ lv_name }}"
+      when: lv_result.changed or (ansible_facts.devices['{{ vg_name }}']['partitions'] is not defined)
+
+    - name: Create temp mountpoint for new /var
+      file:
+        path: "{{ temp_mount }}"
+        state: directory
+
+    - name: Mount new logical volume to temp mountpoint
+      mount:
+        path: "{{ temp_mount }}"
+        src: "/dev/{{ vg_name }}/{{ lv_name }}"
+        fstype: ext4
+        state: mounted
+
+    - name: Copy current /var data to new volume
+      command: rsync -aXS --exclude='/*/.gvfs' /var/ {{ temp_mount }}/
+
+    - name: Bind-mount old /var for rollback (optional, for safety)
+      mount:
+        path: "/var.old"
+        src: "/var"
+        fstype: none
+        opts: bind
+        state: mounted
+      ignore_errors: yes
+
+    - name: Rename old /var and create empty /var for mount
+      command: |
+        mv /var /var.bak && mkdir /var
+      args:
+        creates: /var.bak
+
+    - name: Get UUID of new LVM
+      command: blkid -s UUID -o value /dev/{{ vg_name }}/{{ lv_name }}
+      register: lvm_uuid
+
+    - name: Add new /var mount to /etc/fstab
+      mount:
+        path: "{{ mount_point }}"
+        src: "UUID={{ lvm_uuid.stdout }}"
+        fstype: ext4
+        opts: defaults
+        state: mounted
+
+    - name: Remount /var
+      mount:
+        path: "{{ mount_point }}"
+        src: "UUID={{ lvm_uuid.stdout }}"
+        fstype: ext4
+        state: remounted
+
+    - name: Restore SELinux contexts (if necessary)
+      command: restorecon -RFv /var
+      when: ansible_selinux.status == "enabled"
+      ignore_errors: true
+
+    - name: Remove temp mount directory
+      file:
+        path: "{{ temp_mount }}"
+        state: absent
+
+    - name: Verify /var is mounted
+      shell: mount | grep "on /var "
+      register: var_mount_check
+      failed_when: var_mount_check.rc != 0
+
+    - name: Ensure /var/log is writable
+      file:
+        path: /var/log/test_write
+        state: touch
+
+    - name: Remove test write file
+      file:
+        path: /var/log/test_write
+        state: absent
